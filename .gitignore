@@ -1,0 +1,15 @@
+# 10-K PDFs are not in git (course Dropbox)
+10Ks/
+*.pdf
+
+# generated results
+files/
+
+# python / env
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# macOS
+.DS_Store
