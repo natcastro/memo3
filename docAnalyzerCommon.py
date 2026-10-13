@@ -3,8 +3,15 @@ Shared helpers for Intelligent Document Analysis lab
 """
 import re
 import os
-from typing import List
+# START MEMO EXTENSION 1: imports for the embedding prefilter
+import json
+import hashlib
+from pathlib import Path
+from typing import Dict, List
 
+import numpy as np
+from langchain_ollama import OllamaEmbeddings
+# END MEMO EXTENSION 1
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
@@ -53,6 +60,85 @@ def keyword_hit(chunk: str) -> bool:
 
 def matched_keywords(chunk: str) -> List[str]:
     return [kw for kw in KEYWORDS if kw.casefold() in chunk.casefold()]
+
+
+# START MEMO EXTENSION 2: embedding prefilter (counterpart of keyword_hit())
+# One query per SEC category. A chunk is kept if its best cosine similarity against
+# any of these clears the threshold. keyword_hit() above is left untouched so the
+# two filters can be compared on the same chunks.
+EMBED_QUERIES = {
+    "climate_risks": "Physical and transition climate risks such as hurricanes, wildfires, "
+                     "flooding, drought, or new regulation that could materially affect our "
+                     "operations and financial condition",
+    "emissions": "Our Scope 1 and Scope 2 greenhouse gas emissions in metric tons of CO2 equivalent",
+    "targets_and_goals": "Targets to reduce emissions or achieve net zero by a specific year, "
+                         "and progress toward them",
+    "governance": "Board oversight and management responsibility for climate-related risks",
+    "financials": "Costs, charges, or losses from severe weather events or climate-related "
+                  "initiatives recorded in the financial statements",
+    "mitigation": "Transition plans, scenario analysis, and investments in technology to "
+                  "manage climate risk",
+}
+
+EMBED_MODEL = "embeddinggemma-2:270m"
+EMBED_THRESHOLD = 0.5  # placeholder: step 5 looks at the real score distribution
+EMBED_CACHE_DIR = Path("files/embedding_cache")
+
+_embedders: Dict[str, OllamaEmbeddings] = {}
+_memory_cache: Dict[str, Dict[str, List[float]]] = {}
+
+
+def _cache_path(model: str) -> Path:
+    return EMBED_CACHE_DIR / f"{model.replace(':', '_').replace('/', '_')}.json"
+
+
+def _load_cache(model: str) -> Dict[str, List[float]]:
+    if model not in _memory_cache:
+        path = _cache_path(model)
+        _memory_cache[model] = json.loads(path.read_text()) if path.exists() else {}
+    return _memory_cache[model]
+
+
+def _save_cache(model: str) -> None:
+    path = _cache_path(model)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_memory_cache[model]))
+
+
+def embed_texts(texts: List[str], model: str = EMBED_MODEL) -> np.ndarray:
+    """Returns one L2-normalised vector per text. Vectors are cached on disk per
+    model, so trying a new threshold never re-embeds anything."""
+    cache = _load_cache(model)
+    keys = [hashlib.sha1(t.encode("utf-8")).hexdigest() for t in texts]
+    missing = {k: t for k, t in zip(keys, texts) if k not in cache}
+
+    if missing:
+        if model not in _embedders:
+            _embedders[model] = OllamaEmbeddings(model=model)
+        vectors = _embedders[model].embed_documents(list(missing.values()))
+        for k, v in zip(missing, vectors):
+            cache[k] = v
+        _save_cache(model)
+
+    matrix = np.array([cache[k] for k in keys], dtype=np.float32)
+    return matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+
+
+def embedding_scores(chunks: List[str], model: str = EMBED_MODEL):
+    """For each chunk: (best cosine similarity over EMBED_QUERIES, name of the
+    best-matching category). Use this to inspect the score distribution."""
+    names = list(EMBED_QUERIES)
+    sims = embed_texts(chunks, model) @ embed_texts(list(EMBED_QUERIES.values()), model).T
+    return sims.max(axis=1), [names[i] for i in sims.argmax(axis=1)]
+
+
+def embedding_hit(chunk: str, model: str = EMBED_MODEL, threshold: float = EMBED_THRESHOLD) -> bool:
+    """Drop-in counterpart of keyword_hit(): True if the chunk is similar enough to
+    any climate-disclosure query. For many chunks, call embedding_scores() once
+    instead of this, so the embeddings are computed in one batch."""
+    scores, _ = embedding_scores([chunk], model)
+    return bool(scores[0] >= threshold)
+# END MEMO EXTENSION 2
 
 
 class ClimateDisclosure(BaseModel):
